@@ -3,10 +3,115 @@ import time
 import torch
 import torch.nn as nn
 
-try:
-    from torch_points import knn
-except (ModuleNotFoundError, ImportError):
-    from torch_points_kernels import knn
+class _KNNResolver:
+    def __init__(self):
+        self._loaders = [
+            self._load_torch_points,
+            self._load_torch_points_kernels,
+            self._load_pyg,
+        ]
+        self._cached_backend = None
+
+    def __call__(self, support, query, k):
+        if self._cached_backend is not None:
+            try:
+                return self._cached_backend(support, query, k)
+            except (RuntimeError, ValueError):
+                self._cached_backend = None
+        last_error = None
+        for loader in self._loaders:
+            backend = loader()
+            if backend is None:
+                continue
+            try:
+                result = backend(support, query, k)
+            except (RuntimeError, ValueError) as exc:
+                last_error = exc
+                continue
+            self._cached_backend = backend
+            return result
+        if last_error is not None:
+            raise last_error
+        raise ImportError('No supported k-NN backend found. Install torch_points, torch_points_kernels, or torch_geometric.')
+
+    @staticmethod
+    def _load_torch_points():
+        try:
+            from torch_points import knn as backend
+        except (ModuleNotFoundError, ImportError):
+            return None
+        return backend
+
+    @staticmethod
+    def _load_torch_points_kernels():
+        try:
+            from torch_points_kernels import knn as backend
+        except (ModuleNotFoundError, ImportError):
+            return None
+        return backend
+
+    @staticmethod
+    def _load_pyg():
+        try:
+            from torch_geometric.nn import knn as pyg_knn
+        except (ModuleNotFoundError, ImportError):
+            return None
+
+        def backend(support, query, k):
+            return _pyg_knn(pyg_knn, support, query, k)
+        return backend
+
+
+def _pyg_knn(pyg_knn, support, query, k):
+    B, Ns, C = support.shape
+    _, Nq, _ = query.shape
+    if Ns == 0 or Nq == 0:
+        raise ValueError('Support and query must contain at least one point.')
+    effective_k = min(k, Ns)
+    support_flat = support.reshape(B * Ns, C)
+    query_flat = query.reshape(B * Nq, C)
+    device = support.device
+    batch_template = torch.arange(B, device=device, dtype=torch.long)
+    batch_support = batch_template.repeat_interleave(Ns)
+    batch_query = batch_template.repeat_interleave(Nq)
+
+    row, col = pyg_knn(
+        support_flat,
+        query_flat,
+        effective_k,
+        batch_x=batch_support,
+        batch_y=batch_query,
+        num_workers=0
+    )
+    if row.numel() != query_flat.size(0) * effective_k:
+        raise RuntimeError('PyG knn returned an unexpected number of neighbors.')
+
+    diff = query_flat[col] - support_flat[row]
+    dist = diff.pow(2).sum(dim=1).sqrt()
+
+    perm = torch.argsort(col)
+    row = row[perm]
+    col = col[perm]
+    dist = dist[perm]
+
+    expected = torch.arange(query_flat.size(0), device=col.device, dtype=col.dtype).repeat_interleave(effective_k)
+    if not torch.equal(col, expected):
+        raise RuntimeError('PyG knn returned neighbors in an unexpected order.')
+
+    idx = row.view(B, Nq, effective_k)
+    dist = dist.view(B, Nq, effective_k)
+
+    if effective_k < k:
+        pad_repeat = k - effective_k
+        pad_idx = idx[:, :, -1:].expand(B, Nq, pad_repeat)
+        pad_dist = dist[:, :, -1:].expand(B, Nq, pad_repeat)
+        idx = torch.cat((idx, pad_idx), dim=-1)
+        dist = torch.cat((dist, pad_dist), dim=-1)
+
+    return idx, dist
+
+
+knn = _KNNResolver()
 
 class SharedMLP(nn.Module):
     def __init__(
