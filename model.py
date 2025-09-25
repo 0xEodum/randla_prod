@@ -3,115 +3,76 @@ import time
 import torch
 import torch.nn as nn
 
-class _KNNResolver:
-    def __init__(self):
-        self._loaders = [
-            self._load_torch_points,
-            self._load_torch_points_kernels,
-            self._load_pyg,
-        ]
-        self._cached_backend = None
+try:
+    from torch_points import knn as _knn_backend
+except (ModuleNotFoundError, ImportError):
+    _knn_backend = None
 
-    def __call__(self, support, query, k):
-        if self._cached_backend is not None:
-            try:
-                return self._cached_backend(support, query, k)
-            except (RuntimeError, ValueError):
-                self._cached_backend = None
-        last_error = None
-        for loader in self._loaders:
-            backend = loader()
-            if backend is None:
-                continue
-            try:
-                result = backend(support, query, k)
-            except (RuntimeError, ValueError) as exc:
-                last_error = exc
-                continue
-            self._cached_backend = backend
-            return result
-        if last_error is not None:
-            raise last_error
-        raise ImportError('No supported k-NN backend found. Install torch_points, torch_points_kernels, or torch_geometric.')
 
-    @staticmethod
-    def _load_torch_points():
+
+def _fallback_knn(support, query, k, *, chunk_size=2048):
+    """Compute k-NN using torch.cdist as a backend."""
+    if support.dim() != 3 or query.dim() != 3:
+        raise ValueError('Support and query tensors must have shape (B, N, C)')
+
+    if support.size(-1) != query.size(-1):
+        raise ValueError('Support and query tensors must have the same feature dimension')
+
+    batch_size, query_count, _ = query.shape
+    support_count = support.size(1)
+    if support_count == 0:
+        raise ValueError('Support set must contain at least one point')
+
+    effective_k = min(k, support_count)
+
+    device = query.device
+    dtype = query.dtype
+
+    indices = torch.empty((batch_size, query_count, effective_k), device=device, dtype=torch.long)
+    distances = torch.empty((batch_size, query_count, effective_k), device=device, dtype=dtype)
+
+    chunk_size = max(1, min(chunk_size, query_count))
+
+    for start in range(0, query_count, chunk_size):
+        end = min(start + chunk_size, query_count)
+        query_chunk = query[:, start:end, :]
         try:
-            from torch_points import knn as backend
-        except (ModuleNotFoundError, ImportError):
-            return None
-        return backend
-
-    @staticmethod
-    def _load_torch_points_kernels():
-        try:
-            from torch_points_kernels import knn as backend
-        except (ModuleNotFoundError, ImportError):
-            return None
-        return backend
-
-    @staticmethod
-    def _load_pyg():
-        try:
-            from torch_geometric.nn import knn as pyg_knn
-        except (ModuleNotFoundError, ImportError):
-            return None
-
-        def backend(support, query, k):
-            return _pyg_knn(pyg_knn, support, query, k)
-        return backend
-
-
-def _pyg_knn(pyg_knn, support, query, k):
-    B, Ns, C = support.shape
-    _, Nq, _ = query.shape
-    if Ns == 0 or Nq == 0:
-        raise ValueError('Support and query must contain at least one point.')
-    effective_k = min(k, Ns)
-    support_flat = support.reshape(B * Ns, C)
-    query_flat = query.reshape(B * Nq, C)
-    device = support.device
-    batch_template = torch.arange(B, device=device, dtype=torch.long)
-    batch_support = batch_template.repeat_interleave(Ns)
-    batch_query = batch_template.repeat_interleave(Nq)
-
-    row, col = pyg_knn(
-        support_flat,
-        query_flat,
-        effective_k,
-        batch_x=batch_support,
-        batch_y=batch_query,
-        num_workers=0
-    )
-    if row.numel() != query_flat.size(0) * effective_k:
-        raise RuntimeError('PyG knn returned an unexpected number of neighbors.')
-
-    diff = query_flat[col] - support_flat[row]
-    dist = diff.pow(2).sum(dim=1).sqrt()
-
-    perm = torch.argsort(col)
-    row = row[perm]
-    col = col[perm]
-    dist = dist[perm]
-
-    expected = torch.arange(query_flat.size(0), device=col.device, dtype=col.dtype).repeat_interleave(effective_k)
-    if not torch.equal(col, expected):
-        raise RuntimeError('PyG knn returned neighbors in an unexpected order.')
-
-    idx = row.view(B, Nq, effective_k)
-    dist = dist.view(B, Nq, effective_k)
+            dist = torch.cdist(query_chunk, support, compute_mode='donot_care')
+        except (TypeError, ValueError):
+            dist = torch.cdist(query_chunk, support)
+        chunk_dist, chunk_idx = torch.topk(dist, effective_k, dim=-1, largest=False)
+        indices[:, start:end, :] = chunk_idx
+        distances[:, start:end, :] = chunk_dist
 
     if effective_k < k:
-        pad_repeat = k - effective_k
-        pad_idx = idx[:, :, -1:].expand(B, Nq, pad_repeat)
-        pad_dist = dist[:, :, -1:].expand(B, Nq, pad_repeat)
-        idx = torch.cat((idx, pad_idx), dim=-1)
-        dist = torch.cat((dist, pad_dist), dim=-1)
+        repeat_count = k - effective_k
+        last_indices = indices[:, :, -1:].expand(-1, -1, repeat_count)
+        last_distances = distances[:, :, -1:].expand(-1, -1, repeat_count)
+        indices = torch.cat((indices, last_indices), dim=-1)
+        distances = torch.cat((distances, last_distances), dim=-1)
 
-    return idx, dist
+    return indices, distances
 
 
-knn = _KNNResolver()
+def knn(support, query, k):
+    global _knn_backend
+
+    support = support.contiguous()
+    query = query.contiguous()
+
+    if support.size(1) < k:
+        return _fallback_knn(support, query, k)
+
+    if _knn_backend is not None:
+        try:
+            return _knn_backend(support, query, k)
+        except (RuntimeError, ValueError) as exc:
+            message = str(exc)
+            if 'CUDA version not implemented' not in message:
+                raise
+            _knn_backend = None
+
+    return _fallback_knn(support, query, k)
 
 class SharedMLP(nn.Module):
     def __init__(
@@ -448,3 +409,5 @@ if __name__ == '__main__':
     t1 = time.time()
     # print(pred)
     print(t1-t0)
+
+
