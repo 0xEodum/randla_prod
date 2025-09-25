@@ -45,17 +45,16 @@ def download_archive(url: str, destination: Path) -> None:
                     if total_size:
                         percent = downloaded * 100.0 / total_size
                         sys.stdout.write(
-                            f"Downloaded {human_readable(downloaded)} / {human_readable(total_size)} ({percent:5.1f}%)"
+                            f"Downloaded {human_readable(downloaded)} / {human_readable(total_size)} ({percent:5.1f}%)"
                         )
                     else:
-                        sys.stdout.write(f"Downloaded {human_readable(downloaded)}")
+                        sys.stdout.write(f"Downloaded {human_readable(downloaded)}")
                     sys.stdout.flush()
             except Exception:
                 if destination.exists():
                     destination.unlink()
                 raise
-    sys.stdout.write("
-")
+    sys.stdout.write("")
 
 
 def extract_archive(archive_path: Path, target_dir: Path) -> None:
@@ -110,14 +109,12 @@ def main() -> int:
         try:
             download_archive(DATA_URL, archive_path)
         except KeyboardInterrupt:
-            print("
-Download interrupted; cleaning up.")
+            print("Download interrupted; cleaning up.")
             if archive_path.exists():
                 archive_path.unlink()
             return 1
         except Exception as exc:
-            print(f"
-Failed to download archive: {exc}")
+            print(f"Failed to download archive: {exc}")
             return 1
 
     try:
